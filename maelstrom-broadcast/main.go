@@ -41,17 +41,6 @@ func main() {
 		n.mu.Lock()
 		if !n.seenMessages[body.Message] {
 			n.messages = append(n.messages, body.Message)
-
-			for _, neighbor := range n.node.NodeIDs() {
-				if neighbor == msg.Src || neighbor == n.node.ID() {
-					continue
-				}
-
-				n.node.Send(neighbor, map[string]any{
-					"type":    "broadcast",
-					"message": body.Message,
-				})
-			}
 			n.seenMessages[body.Message] = true
 		}
 		n.mu.Unlock()
