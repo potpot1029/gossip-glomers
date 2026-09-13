@@ -19,8 +19,9 @@ type Node struct {
 }
 
 type BroadcastBody struct {
-	Type    string `json:"type"`
-	Message int    `json:"message"`
+	Type     string `json:"type"`
+	Message  *int   `json:"message,omitempty"`
+	Messages []int  `json:"messages,omitempty"`
 }
 
 type TopologyBody struct {
@@ -29,27 +30,61 @@ type TopologyBody struct {
 }
 
 func (n *Node) retryLoop() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(retryInterval)
 	defer ticker.Stop()
+
 	for range ticker.C {
+		now := time.Now()
+		batch := make(map[string][]int)
+
 		n.mu.Lock()
 
-		now := time.Now()
 		for neighbor, messages := range n.pendingMessages {
 			for message, retryAt := range messages {
 				if now.Before(retryAt) {
 					continue
 				}
 
-				messages[message] = now.Add(500 * time.Millisecond)
-
-				n.send(neighbor, message)
+				batch[neighbor] = append(batch[neighbor], message)
+				messages[message] = now.Add(retryInterval)
 			}
 		}
 
 		n.mu.Unlock()
-	}
 
+		for neighbor, messages := range batch {
+			n.sendBatch(neighbor, messages)
+		}
+	}
+}
+
+func (n *Node) flushLoop() {
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+		batch := make(map[string][]int)
+
+		n.mu.Lock()
+
+		for neighbor, messages := range n.pendingMessages {
+			for message, retryAt := range messages {
+				if now.Before(retryAt) {
+					continue
+				}
+
+				batch[neighbor] = append(batch[neighbor], message)
+				messages[message] = now.Add(retryInterval)
+			}
+		}
+
+		n.mu.Unlock()
+
+		for neighbor, messages := range batch {
+			n.sendBatch(neighbor, messages)
+		}
+	}
 }
 
 func (n *Node) send(target string, message int) {
@@ -65,6 +100,27 @@ func (n *Node) send(target string, message int) {
 		return nil
 	})
 }
+
+func (n *Node) sendBatch(target string, messages []int) {
+	n.node.RPC(target, map[string]any{
+		"type":     "broadcast",
+		"messages": messages,
+	}, func(msg maelstrom.Message) error {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+		for _, message := range messages {
+			delete(n.pendingMessages[target], message)
+		}
+
+		return nil
+	})
+}
+
+const (
+	flushInterval = 100 * time.Millisecond
+	retryInterval = 500 * time.Millisecond
+)
 
 func main() {
 	n := &Node{
@@ -83,29 +139,37 @@ func main() {
 			return err
 		}
 
+		messages := make([]int, 0)
+		if body.Message != nil {
+			messages = append(messages, *body.Message)
+		}
+		if body.Messages != nil {
+			messages = append(messages, body.Messages...)
+		}
+
 		n.mu.Lock()
-		if _, ok := n.seenMessages[body.Message]; !ok {
-			n.messages = append(n.messages, body.Message)
-			n.seenMessages[body.Message] = struct{}{}
+		for _, message := range messages {
+			if _, ok := n.seenMessages[message]; !ok {
+				n.messages = append(n.messages, message)
+				n.seenMessages[message] = struct{}{}
 
-			neighbors := make([]string, 0)
-			if n.node.ID() == hub {
-				neighbors = append(neighbors, n.node.NodeIDs()...)
-			} else {
-				neighbors = append(neighbors, hub)
-			}
-
-			for _, neighbor := range neighbors {
-				if neighbor == msg.Src || neighbor == n.node.ID() {
-					continue
+				neighbors := make([]string, 0)
+				if n.node.ID() == hub {
+					neighbors = append(neighbors, n.node.NodeIDs()...)
+				} else {
+					neighbors = append(neighbors, hub)
 				}
 
-				if n.pendingMessages[neighbor] == nil {
-					n.pendingMessages[neighbor] = make(map[int]time.Time)
-				}
-				n.pendingMessages[neighbor][body.Message] = time.Now().Add(500 * time.Millisecond)
+				for _, neighbor := range neighbors {
+					if neighbor == msg.Src || neighbor == n.node.ID() {
+						continue
+					}
 
-				n.send(neighbor, body.Message)
+					if n.pendingMessages[neighbor] == nil {
+						n.pendingMessages[neighbor] = make(map[int]time.Time)
+					}
+					n.pendingMessages[neighbor][message] = time.Now().Add(flushInterval)
+				}
 			}
 
 		}
@@ -152,6 +216,7 @@ func main() {
 	})
 
 	go n.retryLoop()
+	go n.flushLoop()
 
 	if err := n.node.Run(); err != nil {
 		log.Fatal(err)
