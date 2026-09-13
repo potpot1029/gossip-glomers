@@ -14,7 +14,7 @@ type Node struct {
 	topology        map[string][]string
 	messages        []int
 	seenMessages    map[int]struct{}
-	pendingMessages map[string]map[int]struct{}
+	pendingMessages map[string]map[int]time.Time
 	mu              sync.RWMutex
 }
 
@@ -29,24 +29,21 @@ type TopologyBody struct {
 }
 
 func (n *Node) retryLoop() {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
 		n.mu.Lock()
 
+		now := time.Now()
 		for neighbor, messages := range n.pendingMessages {
-			for message := range messages {
-				n.node.RPC(neighbor, map[string]any{
-					"type":    "broadcast",
-					"message": message,
-				}, func(msg maelstrom.Message) error {
-					n.mu.Lock()
-					defer n.mu.Unlock()
+			for message, retryAt := range messages {
+				if now.Before(retryAt) {
+					continue
+				}
 
-					delete(n.pendingMessages[neighbor], message)
+				messages[message] = now.Add(500 * time.Millisecond)
 
-					return nil
-				})
+				n.send(neighbor, message)
 			}
 		}
 
@@ -55,14 +52,30 @@ func (n *Node) retryLoop() {
 
 }
 
+func (n *Node) send(target string, message int) {
+	n.node.RPC(target, map[string]any{
+		"type":    "broadcast",
+		"message": message,
+	}, func(msg maelstrom.Message) error {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+		delete(n.pendingMessages[target], message)
+
+		return nil
+	})
+}
+
 func main() {
 	n := &Node{
 		node:            maelstrom.NewNode(),
 		messages:        make([]int, 0),
 		seenMessages:    make(map[int]struct{}),
-		pendingMessages: make(map[string]map[int]struct{}),
+		pendingMessages: make(map[string]map[int]time.Time),
 		topology:        make(map[string][]string),
 	}
+
+	hub := "n0"
 
 	n.node.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body BroadcastBody
@@ -75,29 +88,26 @@ func main() {
 			n.messages = append(n.messages, body.Message)
 			n.seenMessages[body.Message] = struct{}{}
 
-			for _, neighbor := range n.topology[n.node.ID()] {
+			neighbors := make([]string, 0)
+			if n.node.ID() == hub {
+				neighbors = append(neighbors, n.node.NodeIDs()...)
+			} else {
+				neighbors = append(neighbors, hub)
+			}
+
+			for _, neighbor := range neighbors {
 				if neighbor == msg.Src || neighbor == n.node.ID() {
 					continue
 				}
 
 				if n.pendingMessages[neighbor] == nil {
-					n.pendingMessages[neighbor] = make(map[int]struct{})
+					n.pendingMessages[neighbor] = make(map[int]time.Time)
 				}
-				n.pendingMessages[neighbor][body.Message] = struct{}{}
+				n.pendingMessages[neighbor][body.Message] = time.Now().Add(500 * time.Millisecond)
 
-				n.node.RPC(neighbor, map[string]any{
-					"type":    "broadcast",
-					"message": body.Message,
-				}, func(msg maelstrom.Message) error {
-					n.mu.Lock()
-					defer n.mu.Unlock()
-
-					delete(n.pendingMessages[neighbor], body.Message)
-
-					return nil
-				})
-
+				n.send(neighbor, body.Message)
 			}
+
 		}
 		n.mu.Unlock()
 
